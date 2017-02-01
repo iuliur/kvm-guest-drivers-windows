@@ -64,8 +64,6 @@ int CParaNdisRX::PrepareReceiveBuffers()
     DPrintf(0, ("[%s] MaxReceiveBuffers %d\n", __FUNCTION__, m_Context->NetMaxReceiveBuffers));
     m_Reinsert = true;
 
-    m_VirtQueue.Kick();
-
     return nRet;
 }
 
@@ -175,7 +173,7 @@ void CParaNdisRX::ReuseReceiveBufferNoLock(pRxNetDescriptor pBuffersDescriptor)
                 m_NetNofReceiveBuffers, m_Context->NetMaxReceiveBuffers));
         }
 
-        /* TODO - nReusedRXBuffes per queue or per context ?*/
+        /* TODO - nReusedRXBuffers per queue or per context ?*/
         if (++m_nReusedRxBuffersCounter >= m_nReusedRxBuffersLimit)
         {
             m_nReusedRxBuffersCounter = 0;
@@ -189,6 +187,11 @@ void CParaNdisRX::ReuseReceiveBufferNoLock(pRxNetDescriptor pBuffersDescriptor)
         ParaNdis_FreeRxBufferDescriptor(m_Context, pBuffersDescriptor);
         m_Context->NetMaxReceiveBuffers--;
     }
+}
+
+VOID CParaNdisRX::KickRXRing()
+{
+    m_VirtQueue.Kick();
 }
 
 VOID CParaNdisRX::ProcessRxRing(CCHAR nCurrCpuReceiveQueue)
@@ -207,9 +210,9 @@ VOID CParaNdisRX::ProcessRxRing(CCHAR nCurrCpuReceiveQueue)
         RemoveEntryList(&pBufferDescriptor->listEntry);
         m_NetNofReceiveBuffers--;
 
-        BOOLEAN packetAnalyzisRC;
+        BOOLEAN packetAnalysisRC;
 
-        packetAnalyzisRC = ParaNdis_PerformPacketAnalyzis(
+        packetAnalysisRC = ParaNdis_PerformPacketAnalysis(
 #if PARANDIS_SUPPORT_RSS
             &m_Context->RSSParameters,
 #endif
@@ -218,7 +221,7 @@ VOID CParaNdisRX::ProcessRxRing(CCHAR nCurrCpuReceiveQueue)
             nFullLength - m_Context->nVirtioHeaderSize);
 
 
-        if (!packetAnalyzisRC)
+        if (!packetAnalysisRC)
         {
             pBufferDescriptor->Queue->ReuseReceiveBufferNoLock(pBufferDescriptor);
             m_Context->Statistics.ifInErrors++;
@@ -289,8 +292,6 @@ void CParaNdisRX::PopulateQueue()
         }
     }
     m_Reinsert = true;
-
-    m_VirtQueue.Kick();
 }
 
 BOOLEAN CParaNdisRX::RestartQueue()

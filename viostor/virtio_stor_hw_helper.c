@@ -16,29 +16,63 @@
 #include"virtio_stor_utils.h"
 
 
-#if (INDIRECT_SUPPORTED)
+#ifdef INDIRECT_SUPPORTED
 #define SET_VA_PA() { ULONG len; va = adaptExt->indirect ? srbExt->desc : NULL; \
-                      pa = va ? ScsiPortGetPhysicalAddress(DeviceExtension, NULL, va, &len).QuadPart : 0; \
+                      pa = va ? StorPortGetPhysicalAddress(DeviceExtension, NULL, va, &len).QuadPart : 0; \
                     }
 #else
 #define SET_VA_PA()    va = NULL; pa = 0;
 #endif
 
-
 BOOLEAN
-SynchronizedFlushRoutine(
-    IN PVOID DeviceExtension,
-    IN PVOID Context
+RhelDoFlush(
+    PVOID DeviceExtension,
+    PSRB_TYPE Srb,
+    BOOLEAN resend,
+    BOOLEAN bIsr
     )
 {
     PADAPTER_EXTENSION  adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
-    PSCSI_REQUEST_BLOCK Srb      = (PSCSI_REQUEST_BLOCK) Context;
-    PRHEL_SRB_EXTENSION srbExt   = (PRHEL_SRB_EXTENSION)Srb->SrbExtension;
-    ULONG               fragLen;
-    PVOID               va;
-    ULONGLONG           pa;
+    PSRB_EXTENSION      srbExt   = SRB_EXTENSION(Srb);
+    ULONG               fragLen = 0UL;
+    PVOID               va = NULL;
+    ULONGLONG           pa = 0ULL;
+
+    ULONG               QueueNumber = 0;
+    ULONG               OldIrql = 0;
+    ULONG               MessageId = 0;
+    BOOLEAN             result = FALSE;
+    bool                notify = FALSE;
+    STOR_LOCK_HANDLE    LockHandle = { 0 };
+    ULONG               status = STOR_STATUS_SUCCESS;
+    struct virtqueue    *vq = NULL;
 
     SET_VA_PA();
+
+    if (resend) {
+        MessageId = srbExt->MessageID;
+        QueueNumber = MessageId - 1;
+    } else if (adaptExt->num_queues > 1) {
+        STARTIO_PERFORMANCE_PARAMETERS param;
+        param.Size = sizeof(STARTIO_PERFORMANCE_PARAMETERS);
+        status = StorPortGetStartIoPerfParams(DeviceExtension, (PSCSI_REQUEST_BLOCK)Srb, &param);
+        if (status == STOR_STATUS_SUCCESS && param.MessageNumber != 0) {
+           MessageId = param.MessageNumber;
+           QueueNumber = MessageId - 1;
+           RhelDbgPrint(TRACE_LEVEL_INFORMATION, ("%s srb %p, cpu %d :: QueueNumber %lu, MessageNumber %lu, ChannelNumber %lu.\n",  __FUNCTION__, Srb, srbExt->cpu, QueueNumber, param.MessageNumber, param.ChannelNumber));
+        }
+        else {
+           RhelDbgPrint(TRACE_LEVEL_ERROR, ("%s StorPortGetStartIoPerfParams failed. srb %p cpu %d status 0x%x.\n",__FUNCTION__, Srb, srbExt->cpu, status));
+           QueueNumber = 0;
+           MessageId = 1;
+        }
+    } else {
+        QueueNumber = 0;
+        MessageId = 1;
+    }
+
+    srbExt->MessageID = MessageId;
+    vq = adaptExt->vq[QueueNumber];
 
     srbExt->vbr.out_hdr.sector = 0;
     srbExt->vbr.out_hdr.ioprio = 0;
@@ -47,171 +81,124 @@ SynchronizedFlushRoutine(
     srbExt->out                = 1;
     srbExt->in                 = 1;
 
-    srbExt->vbr.sg[0].physAddr = ScsiPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.out_hdr, &fragLen);
+    srbExt->vbr.sg[0].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.out_hdr, &fragLen);
     srbExt->vbr.sg[0].length   = sizeof(srbExt->vbr.out_hdr);
-    srbExt->vbr.sg[1].physAddr = ScsiPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.status, &fragLen);
+    srbExt->vbr.sg[1].physAddr = StorPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.status, &fragLen);
     srbExt->vbr.sg[1].length   = sizeof(srbExt->vbr.status);
 
-    if (virtqueue_add_buf(adaptExt->vq,
+    VioStorVQLock(DeviceExtension, MessageId, &LockHandle, FALSE);
+    if (virtqueue_add_buf(vq,
                      &srbExt->vbr.sg[0],
                      srbExt->out, srbExt->in,
                      &srbExt->vbr, va, pa) >= 0) {
-           virtqueue_kick(adaptExt->vq);
-        return TRUE;
-    }
-    virtqueue_kick(adaptExt->vq);
-#ifdef USE_STORPORT
-    StorPortBusy(DeviceExtension, 2);
+        notify = virtqueue_kick_prepare(vq);
+        VioStorVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
+        result = TRUE;
+#ifdef DBG
+        InterlockedIncrement((LONG volatile*)&adaptExt->inqueue_cnt);
 #endif
-    return FALSE;
+    }
+    else {
+        VioStorVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
+        RhelDbgPrint(TRACE_LEVEL_FATAL, ("%s Can not add packet to queue %d.\n", __FUNCTION__, QueueNumber));
+        StorPortBusy(DeviceExtension, 2);
+    }
+    if (notify) {
+        virtqueue_notify(vq);
+    }
+
+    return result;
 }
 
-#ifdef USE_STORPORT
 BOOLEAN
-RhelDoFlush(
-    PVOID DeviceExtension,
-    PSCSI_REQUEST_BLOCK Srb,
-    BOOLEAN sync
-    )
-{
-    if (sync) {
-       return StorPortSynchronizeAccess(DeviceExtension, SynchronizedFlushRoutine, Srb);
-    } else {
-       return SynchronizedFlushRoutine(DeviceExtension, Srb);
-    }
-}
-#else
-BOOLEAN
-RhelDoFlush(
-    PVOID DeviceExtension,
-    PSCSI_REQUEST_BLOCK Srb,
-    BOOLEAN sync
-    )
-{
-    UNREFERENCED_PARAMETER(sync);
-    return SynchronizedFlushRoutine(DeviceExtension, Srb);
-}
-#endif
-
-#ifdef USE_STORPORT
-BOOLEAN
-SynchronizedReadWriteRoutine(
-    IN PVOID DeviceExtension,
-    IN PVOID Context
-    )
+RhelDoReadWrite(PVOID DeviceExtension,
+                PSRB_TYPE Srb)
 {
     PADAPTER_EXTENSION  adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
-    PSCSI_REQUEST_BLOCK Srb      = (PSCSI_REQUEST_BLOCK) Context;
-    PRHEL_SRB_EXTENSION srbExt   = (PRHEL_SRB_EXTENSION)Srb->SrbExtension;
-    PVOID               va;
-    ULONGLONG           pa;
+    PSRB_EXTENSION      srbExt   = SRB_EXTENSION(Srb);
+    PVOID               va = NULL;
+    ULONGLONG           pa = 0ULL;
+
+    ULONG               QueueNumber = 0;
+    ULONG               OldIrql = 0;
+    ULONG               MessageId = 0;
+    BOOLEAN             result = FALSE;
+    bool                notify = FALSE;
+    STOR_LOCK_HANDLE    LockHandle = { 0 };
+    ULONG               status = STOR_STATUS_SUCCESS;
+    struct virtqueue    *vq = NULL;
 
     SET_VA_PA();
 
-    if (virtqueue_add_buf(adaptExt->vq,
-                     &srbExt->vbr.sg[0],
-                     srbExt->out, srbExt->in,
-                     &srbExt->vbr, va, pa) >= 0){
-        InsertTailList(&adaptExt->list_head, &srbExt->vbr.list_entry);
-           virtqueue_kick(adaptExt->vq);
-        return TRUE;
-    }
-    virtqueue_kick(adaptExt->vq);
-    StorPortBusy(DeviceExtension, 2);
-    return FALSE;
-}
-
-BOOLEAN
-RhelDoReadWrite(PVOID DeviceExtension,
-                PSCSI_REQUEST_BLOCK Srb)
-{
-    return StorPortSynchronizeAccess(DeviceExtension, SynchronizedReadWriteRoutine, (PVOID)Srb);
-}
-#else
-BOOLEAN
-RhelDoReadWrite(PVOID DeviceExtension,
-                PSCSI_REQUEST_BLOCK Srb)
-{
-    PCDB                  cdb;
-    ULONG                 fragLen;
-    ULONG                 sgElement;
-    ULONG                 BytesLeft;
-    PVOID                 DataBuffer;
-    PADAPTER_EXTENSION    adaptExt;
-    PRHEL_SRB_EXTENSION   srbExt;
-    int                   num_free;
-    PVOID                 va;
-    ULONGLONG             pa;
-    ULONG                 i;
-    ULONG                 sgMaxElements;
-
-    cdb      = (PCDB)&Srb->Cdb[0];
-    srbExt   = (PRHEL_SRB_EXTENSION)Srb->SrbExtension;
-    adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
-    BytesLeft= Srb->DataTransferLength;
-    DataBuffer = Srb->DataBuffer;
-
-    memset(srbExt, 0, sizeof (RHEL_SRB_EXTENSION));
-    sgMaxElements = MAX_PHYS_SEGMENTS + 1;
-    for (i = 0, sgElement = 1; (i < sgMaxElements) && BytesLeft; i++, sgElement++) {
-        srbExt->vbr.sg[sgElement].physAddr = ScsiPortGetPhysicalAddress(DeviceExtension, Srb, DataBuffer, &fragLen);
-        srbExt->vbr.sg[sgElement].length   = fragLen;
-        srbExt->Xfer += fragLen;
-        BytesLeft -= fragLen;
-        DataBuffer = (PVOID)((ULONG_PTR)DataBuffer + fragLen);
-    }
-
-    srbExt->vbr.out_hdr.sector = RhelGetLba(DeviceExtension, cdb);
-    srbExt->vbr.out_hdr.ioprio = 0;
-    srbExt->vbr.req            = (struct request *)Srb;
-
-    if (Srb->SrbFlags & SRB_FLAGS_DATA_OUT) {
-        srbExt->vbr.out_hdr.type = VIRTIO_BLK_T_OUT;
-        srbExt->out = sgElement;
-        srbExt->in = 1;
-    } else {
-        srbExt->vbr.out_hdr.type = VIRTIO_BLK_T_IN;
-        srbExt->out = 1;
-        srbExt->in = sgElement;
-    }
-
-    srbExt->vbr.sg[0].physAddr = ScsiPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.out_hdr, &fragLen);
-    srbExt->vbr.sg[0].length = sizeof(srbExt->vbr.out_hdr);
-
-    srbExt->vbr.sg[sgElement].physAddr = ScsiPortGetPhysicalAddress(DeviceExtension, NULL, &srbExt->vbr.status, &fragLen);
-    srbExt->vbr.sg[sgElement].length = sizeof(srbExt->vbr.status);
-
-    SET_VA_PA();
-    num_free = virtqueue_add_buf(adaptExt->vq,
-                                      &srbExt->vbr.sg[0],
-                                      srbExt->out, srbExt->in,
-                                      &srbExt->vbr, va, pa);
-
-    if ( num_free >= 0) {
-        InsertTailList(&adaptExt->list_head, &srbExt->vbr.list_entry);
-        virtqueue_kick(adaptExt->vq);
-        srbExt->call_next = FALSE;
-        if(!adaptExt->indirect && num_free < VIRTIO_MAX_SG) {
-            srbExt->call_next = TRUE;
-        } else {
-           ScsiPortNotification(NextLuRequest, DeviceExtension, Srb->PathId, Srb->TargetId, Srb->Lun);
+    if (adaptExt->num_queues > 1) {
+        STARTIO_PERFORMANCE_PARAMETERS param;
+        param.Size = sizeof(STARTIO_PERFORMANCE_PARAMETERS);
+        status = StorPortGetStartIoPerfParams(DeviceExtension, (PSCSI_REQUEST_BLOCK)Srb, &param);
+        if (status == STOR_STATUS_SUCCESS && param.MessageNumber != 0) {
+           MessageId = param.MessageNumber;
+           QueueNumber = MessageId - 1;
+           RhelDbgPrint(TRACE_LEVEL_INFORMATION, ("%s srb %p, cpu %d :: QueueNumber %lu, MessageNumber %lu, ChannelNumber %lu.\n", __FUNCTION__, Srb, srbExt->cpu, QueueNumber, param.MessageNumber, param.ChannelNumber));
+        }
+        else {
+           RhelDbgPrint(TRACE_LEVEL_ERROR, ("%s StorPortGetStartIoPerfParams failed srb %p cpu %d status 0x%x.\n", __FUNCTION__, Srb, srbExt->cpu, status));
+           QueueNumber = 0;
+           MessageId = 1;
         }
     }
-    return TRUE;
-}
+    else {
+        QueueNumber = 0;
+        MessageId = 1;
+    }
+
+    srbExt->MessageID = MessageId;
+    vq = adaptExt->vq[QueueNumber];
+    RhelDbgPrint(TRACE_LEVEL_VERBOSE, ("<--->%s : QueueNumber 0x%x vq = %p\n", __FUNCTION__, QueueNumber, vq));
+
+    VioStorVQLock(DeviceExtension, MessageId, &LockHandle, FALSE);
+    if (virtqueue_add_buf(vq,
+                     &srbExt->vbr.sg[0],
+                     srbExt->out, srbExt->in,
+                     &srbExt->vbr, va, pa) >= 0) {
+        notify = virtqueue_kick_prepare(vq);
+        VioStorVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
+#ifdef DBG
+        InterlockedIncrement((LONG volatile*)&adaptExt->inqueue_cnt);
 #endif
+        result = TRUE;
+    }
+    else {
+        VioStorVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
+        RhelDbgPrint(TRACE_LEVEL_FATAL, ("%s Can not add packet to queue %d.\n", __FUNCTION__, QueueNumber));
+        StorPortBusy(DeviceExtension, 2);
+    }
+    if (notify) {
+        virtqueue_notify(vq);
+    }
+
+#if (NTDDI_VERSION > NTDDI_WIN7)
+    if (adaptExt->num_queues > 1) {
+        if (CHECKFLAG(adaptExt->perfFlags, STOR_PERF_OPTIMIZE_FOR_COMPLETION_DURING_STARTIO)) {
+           VioStorCompleteRequest(DeviceExtension, MessageId, FALSE);
+        }
+    }
+#endif
+    return result;
+}
 
 VOID
 RhelShutDown(
     IN PVOID DeviceExtension
     )
 {
+    ULONG index;
     PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
 
     virtio_device_reset(&adaptExt->vdev);
     virtio_delete_queues(&adaptExt->vdev);
+    for (index = 0; index < adaptExt->num_queues; ++index) {
+        adaptExt->vq[index] = NULL;
+    }
     virtio_device_shutdown(&adaptExt->vdev);
-    adaptExt->vq = NULL;
 }
 
 ULONGLONG
@@ -271,7 +258,16 @@ RhelGetSerialNumber(
     IN PVOID DeviceExtension
 )
 {
-    PADAPTER_EXTENSION adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+    ULONG               QueueNumber = 0;
+    ULONG               OldIrql = 0;
+    ULONG               MessageId = 0;
+    STOR_LOCK_HANDLE    LockHandle = { 0 };
+    struct virtqueue    *vq = NULL;
+    PADAPTER_EXTENSION  adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+
+    QueueNumber = 0;
+    MessageId = 1;
+    vq = adaptExt->vq[QueueNumber];
 
     adaptExt->vbr.out_hdr.type = VIRTIO_BLK_T_GET_ID | VIRTIO_BLK_T_IN;
     adaptExt->vbr.out_hdr.sector = 0;
@@ -284,12 +280,17 @@ RhelGetSerialNumber(
     adaptExt->vbr.sg[2].physAddr = MmGetPhysicalAddress(&adaptExt->vbr.status);
     adaptExt->vbr.sg[2].length   = sizeof(adaptExt->vbr.status);
 
-    if (virtqueue_add_buf(adaptExt->vq,
+//    VioStorVQLock(DeviceExtension, MessageId, &LockHandle, FALSE);
+    if (virtqueue_add_buf(vq,
                      &adaptExt->vbr.sg[0],
                      1, 2,
                      &adaptExt->vbr, NULL, 0) >= 0) {
-        virtqueue_kick(adaptExt->vq);
+#ifdef DBG
+        InterlockedIncrement((LONG volatile*)&adaptExt->inqueue_cnt);
+#endif
+        virtqueue_kick_always(vq);
     }
+//    VioStorVQUnlock(DeviceExtension, MessageId, &LockHandle, FALSE);
 }
 
 VOID
@@ -368,4 +369,73 @@ RhelGetDiskGeometry(
                           &adaptExt->info.opt_io_size, sizeof(adaptExt->info.opt_io_size));
         RhelDbgPrint(TRACE_LEVEL_INFORMATION, ("opt_io_size = %d\n", adaptExt->info.opt_io_size));
     }
+}
+
+VOID
+VioStorVQLock(
+    IN PVOID DeviceExtension,
+    IN ULONG MessageID,
+    IN OUT PSTOR_LOCK_HANDLE LockHandle,
+    IN BOOLEAN isr
+    )
+{
+    PADAPTER_EXTENSION  adaptExt;
+    RhelDbgPrint(TRACE_LEVEL_VERBOSE, ("--->%s MessageID = %d\n", __FUNCTION__, MessageID));
+
+    adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+
+    if (!adaptExt->msix_enabled) {
+        if (!isr) {
+            StorPortAcquireSpinLock(DeviceExtension, InterruptLock, NULL, LockHandle);
+        }
+    }
+    else {
+        if ((adaptExt->num_queues == 1) ||
+            (!CHECKFLAG(adaptExt->perfFlags, STOR_PERF_CONCURRENT_CHANNELS))) {
+            if (!isr) {
+                ULONG oldIrql = 0;
+                StorPortAcquireMSISpinLock(DeviceExtension, (adaptExt->msix_one_vector ? 0 : MessageID), &oldIrql);
+                LockHandle->Context.OldIrql = (KIRQL)oldIrql;
+            }
+        }
+        else {
+            NT_ASSERT(MessageID > 0);
+            NT_ASSERT(MessageID <= adaptExt->num_queues);
+            StorPortAcquireSpinLock(DeviceExtension, StartIoLock, &adaptExt->dpc[MessageID - 1], LockHandle);
+        }
+    }
+    RhelDbgPrint(TRACE_LEVEL_VERBOSE, ("<---%s MessageID = %d\n", __FUNCTION__, MessageID));
+}
+
+VOID
+VioStorVQUnlock(
+    IN PVOID DeviceExtension,
+    IN ULONG MessageID,
+    IN PSTOR_LOCK_HANDLE LockHandle,
+    IN BOOLEAN isr
+    )
+{
+    PADAPTER_EXTENSION  adaptExt;
+    RhelDbgPrint(TRACE_LEVEL_VERBOSE, ("--->%s MessageID = %d\n", __FUNCTION__, MessageID));
+    adaptExt = (PADAPTER_EXTENSION)DeviceExtension;
+
+    if (!adaptExt->msix_enabled) {
+        if (!isr) {
+            StorPortReleaseSpinLock(DeviceExtension, LockHandle);
+        }
+    }
+    else {
+        if ((adaptExt->num_queues == 1) ||
+            (!CHECKFLAG(adaptExt->perfFlags, STOR_PERF_CONCURRENT_CHANNELS))) {
+            if (!isr) {
+                StorPortReleaseMSISpinLock(DeviceExtension, (adaptExt->msix_one_vector ? 0 : MessageID), LockHandle->Context.OldIrql);
+            }
+        }
+        else {
+            NT_ASSERT(MessageID > 0);
+            NT_ASSERT(MessageID <= adaptExt->num_queues);
+            StorPortReleaseSpinLock(DeviceExtension, LockHandle);
+        }
+    }
+    RhelDbgPrint(TRACE_LEVEL_VERBOSE, ("<---%s MessageID = %d\n", __FUNCTION__, MessageID));
 }

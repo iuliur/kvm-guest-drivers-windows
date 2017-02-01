@@ -4,7 +4,7 @@
  * File: virtio_stor.h
  *
  * Main include file
- * This file contains vrious routines and globals
+ * This file contains various routines and globals
  *
  * This work is licensed under the terms of the GNU GPL, version 2.  See
  * the COPYING file in the top-level directory.
@@ -15,20 +15,16 @@
 #define ___VIOSTOR_H__
 
 #include <ntddk.h>
-#ifdef USE_STORPORT
-#define STOR_USE_SCSI_ALIASES
 #include <storport.h>
-#else
-#include <scsi.h>
-#endif
 
 #include "osdep.h"
 #include "virtio_pci.h"
 #include "virtio.h"
 #include "virtio_ring.h"
+#include "virtio_stor_utils.h"
+#include "virtio_stor_hw_helper.h"
 
 typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
-
 
 /* Feature bits */
 #define VIRTIO_BLK_F_BARRIER    0       /* Does host support barriers? */
@@ -38,8 +34,10 @@ typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
 #define VIRTIO_BLK_F_RO         5       /* Disk is read-only */
 #define VIRTIO_BLK_F_BLK_SIZE   6       /* Block size of disk is available*/
 #define VIRTIO_BLK_F_SCSI       7       /* Supports scsi command passthru */
-#define VIRTIO_BLK_F_WCACHE     9       /* write cache enabled */
+#define VIRTIO_BLK_F_FLUSH      9       /* Flush command supported */
 #define VIRTIO_BLK_F_TOPOLOGY   10      /* Topology information is available */
+#define VIRTIO_BLK_F_CONFIG_WCE 11      /* Writeback mode available in config */
+#define VIRTIO_BLK_F_MQ         12      /* support more than one vq */
 
 /* These two define direction. */
 #define VIRTIO_BLK_T_IN         0
@@ -55,6 +53,9 @@ typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
 
 #define SECTOR_SIZE             512
 #define IO_PORT_LENGTH          0x40
+#define MAX_CPU                 256
+
+#define VIRTIO_BLK_QUEUE_LAST   MAX_CPU
 
 #define VIRTIO_RING_F_INDIRECT_DESC     28
 
@@ -67,6 +68,8 @@ typedef struct VirtIOBufferDescriptor VIO_SG, *PVIO_SG;
 #endif
 
 #define VIRTIO_MAX_SG           (3+MAX_PHYS_SEGMENTS)
+
+#define VIOBLK_POOL_TAG        'BoiV'
 
 #pragma pack(1)
 typedef struct virtio_blk_config {
@@ -87,7 +90,12 @@ typedef struct virtio_blk_config {
     u8  physical_block_exp;
     u8  alignment_offset;
     u16 min_io_size;
-    u16 opt_io_size;
+    u32 opt_io_size;
+    /* writeback mode (if VIRTIO_BLK_F_CONFIG_WCE) */
+    u8 wce;
+    u8 unused;
+    /* number of vqs, only available when VIRTIO_BLK_F_MQ is set */
+    u16 num_queues;
 }blk_config, *pblk_config;
 #pragma pack()
 
@@ -126,14 +134,15 @@ typedef struct _ADAPTER_EXTENSION {
     ULONG                 poolAllocationSize;
     ULONG                 poolOffset;
 
-    struct virtqueue *    vq;
+    struct virtqueue *    vq[VIRTIO_BLK_QUEUE_LAST];
+    USHORT                num_queues;
     INQUIRYDATA           inquiry_data;
     blk_config            info;
     ULONG                 queue_depth;
     BOOLEAN               dump_mode;
-    LIST_ENTRY            list_head;
     ULONG                 msix_vectors;
     BOOLEAN               msix_enabled;
+    BOOLEAN               msix_one_vector;
     ULONGLONG             features;
     CHAR                  sn[BLOCK_SERIAL_STRLEN];
     BOOLEAN               sn_ok;
@@ -148,14 +157,16 @@ typedef struct _ADAPTER_EXTENSION {
     VIRTIO_BAR            pci_bars[PCI_TYPE0_ADDRESSES];
     ULONG                 system_io_bus_number;
 
-#ifdef USE_STORPORT
-    LIST_ENTRY            complete_list;
-    STOR_DPC              completion_dpc;
+    ULONG                 perfFlags;
+    PSTOR_DPC             dpc;
     BOOLEAN               dpc_ok;
+#ifdef DBG
+    ULONG                 srb_cnt;
+    ULONG                 inqueue_cnt;
 #endif
 }ADAPTER_EXTENSION, *PADAPTER_EXTENSION;
 
-#if (INDIRECT_SUPPORTED == 1)
+#ifdef INDIRECT_SUPPORTED
 typedef struct _VRING_DESC_ALIAS
 {
     union
@@ -166,19 +177,20 @@ typedef struct _VRING_DESC_ALIAS
 }VRING_DESC_ALIAS;
 #endif
 
-typedef struct _RHEL_SRB_EXTENSION {
+typedef struct _SRB_EXTENSION {
     blk_req               vbr;
     ULONG                 out;
     ULONG                 in;
     ULONG                 Xfer;
+    ULONG                 MessageID;
     BOOLEAN               fua;
-#ifndef USE_STORPORT
-    BOOLEAN               call_next;
-#endif
-#if INDIRECT_SUPPORTED
+#ifdef INDIRECT_SUPPORTED
     VRING_DESC_ALIAS      desc[VIRTIO_MAX_SG];
 #endif
-}RHEL_SRB_EXTENSION, *PRHEL_SRB_EXTENSION;
+#if DBG
+    UCHAR                 cpu;
+#endif
+}SRB_EXTENSION, *PSRB_EXTENSION;
 
 BOOLEAN
 VirtIoInterrupt(

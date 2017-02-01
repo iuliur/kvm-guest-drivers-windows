@@ -92,7 +92,7 @@ public:
     { return (ParsePriority() && ParseBuffers() && ParseOffloads()); }
     void StartMapping();
     void RegisterMappedNB(CNB *NB);
-    bool MappingSuceeded() { return !m_HaveFailedMappings; }
+    bool MappingSucceeded() { return !m_HaveFailedMappings; }
     void SetStatus(NDIS_STATUS Status)
     { m_NBL->Status = Status; }
 
@@ -179,6 +179,7 @@ private:
 
     ULONG m_MaxDataLength = 0;
     ULONG m_TransferSize = 0;
+    ULONG  m_LogIndex;
 
     UINT16 m_TCI = 0;
 
